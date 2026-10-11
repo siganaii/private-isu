@@ -1,0 +1,10 @@
+[mysqld]
+# コンテナのメモリ上限が 1GB で、バッファプール以外にも 600MB 前後使うので 256MB に抑える
+# （よく読むデータは comments とインデックス程度で小さい。画像の BLOB はほぼ読まない）
+innodb_buffer_pool_size = 256M
+
+# コミットごとの fsync をやめる（OS クラッシュ時に最大1秒分の更新を失う可能性がある）
+innodb_flush_log_at_trx_commit = 2
+
+# レプリケーションしないのでバイナリログは不要
+disable-log-bin

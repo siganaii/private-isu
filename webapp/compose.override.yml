@@ -1,0 +1,24 @@
+# ローカル計測用の CPU 割り当て（compose.yml と同じディレクトリにあれば docker compose が自動で読み込む）
+#
+# 本番想定の競技者用サーバー c7a.large（2 vCPU）に近づけるため、アプリ側の全コンテナで
+# CPU 0,1 の2コアを共有する。ベンチマーカーは別サーバーの想定なので、CPU 4〜7 で動かす
+# （docker run --cpuset-cpus=4-7）。CPU 2,3 は空けておき、ベンチマーカーとの干渉を避ける
+#
+# compose.yml の cpus: "1" の上限も外す。同じサーバー上のプロセスは2コアとも使えるため
+services:
+  app:
+    cpuset: "0,1"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+  mysql:
+    cpuset: "0,1"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+  nginx:
+    cpuset: "0,1"
+  memcached:
+    cpuset: "0,1"

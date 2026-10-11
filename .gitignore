@@ -16,3 +16,6 @@ portal/tmp
 !/portal/log/.keep
 /portal/tmp
 .vagrant
+
+# アプリが投稿画像を書き出すディレクトリ（nginx が直接配信する）
+/webapp/public/image/
