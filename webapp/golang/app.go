@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -749,142 +750,40 @@ func writePost(b *bytes.Buffer, p Post) {
 `)
 }
 
-// ページの HTML を組み立てるバッファを使い回す（元は templates/*.html を html/template で描画していた。
-// html/template のリフレクションと文脈ごとのエスケープが CPU の1割強を占めていたので、すべて手書きにした）
-var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
-
-// 組み立てた HTML を1回の write で送る
-func writeHTML(w http.ResponseWriter, b *bytes.Buffer) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(b.Bytes())
-	b.Reset()
-	bufPool.Put(b)
+func renderPost(p Post) template.HTML {
+	var b bytes.Buffer
+	writePost(&b, p)
+	return template.HTML(b.String())
 }
 
-// layout.html の前半（ヘッダーまで）
-func writeLayoutHeader(b *bytes.Buffer, me User) {
-	b.WriteString(`<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>Iscogram</title>
-    <link href="/css/style.css" media="screen" rel="stylesheet" type="text/css">
-  </head>
-  <body>
-    <div class="container">
-      <div class="header">
-        <div class="isu-title">
-          <h1><a href="/">Iscogram</a></h1>
-        </div>
-        <div class="isu-header-menu">
-`)
-	if me.ID == 0 {
-		b.WriteString(`          <div><a href="/login">ログイン</a></div>
-`)
-	} else {
-		name := html.EscapeString(me.AccountName)
-		b.WriteString(`          <div><a href="/@`)
-		b.WriteString(name)
-		b.WriteString(`"><span class="isu-account-name">`)
-		b.WriteString(name)
-		b.WriteString(`</span>さん</a></div>
-`)
-		if me.Authority == 1 {
-			b.WriteString(`          <div><a href="/admin/banned">管理者用ページ</a></div>
-`)
-		}
-		b.WriteString(`          <div><a href="/logout">ログアウト</a></div>
-`)
+func renderPosts(posts []Post) template.HTML {
+	var b bytes.Buffer
+	b.Grow(len(posts) * 2048)
+	for _, p := range posts {
+		writePost(&b, p)
 	}
-	b.WriteString(`        </div>
-      </div>
-
-`)
+	return template.HTML(b.String())
 }
 
-// layout.html の後半
-func writeLayoutFooter(b *bytes.Buffer) {
-	b.WriteString(`
-    </div>
-    <script src="/js/timeago.min.js"></script>
-    <script src="/js/main.js"></script>
-  </body>
-</html>
-`)
-}
-
-func writeFlash(b *bytes.Buffer, flash string) {
-	if flash == "" {
+// バッファに描画してから1回で送る。ResponseWriter に直接 Execute すると 4KB ごとに write が発生する
+func render(w http.ResponseWriter, t *template.Template, data any) {
+	var b bytes.Buffer
+	if err := t.Execute(&b, data); err != nil {
+		log.Print(err)
 		return
 	}
-	b.WriteString(`<div id="notice-message" class="alert alert-danger">
-  `)
-	b.WriteString(html.EscapeString(flash))
-	b.WriteString(`
-</div>
-`)
-}
-
-// posts.html
-func writePosts(b *bytes.Buffer, posts []Post) {
-	b.WriteString(`<div class="isu-posts">
-`)
-	for _, p := range posts {
-		writePost(b, p)
-	}
-	b.WriteString(`</div>
-`)
-}
-
-// login.html と register.html（見出しとフォームの送り先だけが違う）
-func writeAccountForm(b *bytes.Buffer, me User, title, action, flash string, registerLink bool) {
-	writeLayoutHeader(b, me)
-	b.WriteString(`<div class="header">
-  <h1>`)
-	b.WriteString(title)
-	b.WriteString(`</h1>
-</div>
-
-`)
-	writeFlash(b, flash)
-	b.WriteString(`
-<div class="submit">
-  <form method="post" action="`)
-	b.WriteString(action)
-	b.WriteString(`">
-    <div class="form-account-name">
-      <span>アカウント名</span>
-      <input type="text" name="account_name">
-    </div>
-    <div class="form-password">
-      <span>パスワード</span>
-      <input type="password" name="password">
-    </div>
-    <div class="form-submit">
-      <input type="submit" name="submit" value="submit">
-    </div>
-  </form>
-</div>
-`)
-	if registerLink {
-		b.WriteString(`
-<div class="isu-register">
-  <a href="/register">ユーザー登録</a>
-</div>
-`)
-	}
-	writeLayoutFooter(b)
+	w.Write(b.Bytes())
 }
 
 // 画像をファイルに書き出す。nginx が書きかけのファイルを返さないよう、一時ファイルに書いてから rename する
-func writeImageFile(id int, mime string, data []byte) error {
+func writeImageFile(id int, mime string, src io.Reader) error {
 	tmp, err := os.CreateTemp(imageDir, ".tmp-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
 
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := io.Copy(tmp, src); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -919,6 +818,48 @@ func secureRandomStr(b int) string {
 	return fmt.Sprintf("%x", k)
 }
 
+func getTemplPath(filename string) string {
+	return path.Join("templates", filename)
+}
+
+// テンプレートは起動時に1回だけパースし、リクエストごとには Execute だけを行う
+var (
+	fmap = template.FuncMap{
+		"renderPost":  renderPost,
+		"renderPosts": renderPosts,
+	}
+
+	loginTemplate = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("login.html"),
+	))
+	registerTemplate = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("register.html"),
+	))
+	indexTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("index.html"),
+		getTemplPath("posts.html"),
+	))
+	userTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("user.html"),
+		getTemplPath("posts.html"),
+	))
+	postsTemplate = template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+		getTemplPath("posts.html"),
+	))
+	postIDTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("post_id.html"),
+	))
+	bannedTemplate = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("banned.html"),
+	))
+)
+
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
@@ -933,10 +874,10 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flash := getFlash(w, r, "notice")
-	b := bufPool.Get().(*bytes.Buffer)
-	writeAccountForm(b, me, "ログイン", "/login", flash, true)
-	writeHTML(w, b)
+	render(w, loginTemplate, struct {
+		Me    User
+		Flash string
+	}{me, getFlash(w, r, "notice")})
 }
 
 func postLogin(w http.ResponseWriter, r *http.Request) {
@@ -969,10 +910,10 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flash := getFlash(w, r, "notice")
-	b := bufPool.Get().(*bytes.Buffer)
-	writeAccountForm(b, User{}, "ユーザー登録", "/register", flash, false)
-	writeHTML(w, b)
+	render(w, registerTemplate, struct {
+		Me    User
+		Flash string
+	}{User{}, getFlash(w, r, "notice")})
 }
 
 func postRegister(w http.ResponseWriter, r *http.Request) {
@@ -1053,49 +994,12 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csrfToken := getCSRFToken(r)
-	// getFlash は Cookie を書き換えるので、本文を書き始める前に呼ぶ
-	flash := getFlash(w, r, "notice")
-
-	// index.html
-	b := bufPool.Get().(*bytes.Buffer)
-	writeLayoutHeader(b, me)
-	b.WriteString(`<div class="isu-submit">
-  <form method="post" action="/" enctype="multipart/form-data">
-    <div class="isu-form">
-      <input type="file" name="file" value="file">
-    </div>
-    <div class="isu-form">
-      <textarea name="body"></textarea>
-    </div>
-    <div class="form-submit">
-      <input type="hidden" name="csrf_token" value="`)
-	b.WriteString(html.EscapeString(csrfToken))
-	b.WriteString(`">
-      <input type="submit" name="submit" value="submit">
-    </div>
-`)
-	if flash != "" {
-		b.WriteString(`    <div id="notice-message" class="alert alert-danger">
-      `)
-		b.WriteString(html.EscapeString(flash))
-		b.WriteString(`
-    </div>
-`)
-	}
-	b.WriteString(`  </form>
-</div>
-
-`)
-	writePosts(b, posts)
-	b.WriteString(`
-<div id="isu-post-more">
-  <button id="isu-post-more-btn">もっと見る</button>
-  <img class="isu-loading-icon" src="/img/ajax-loader.gif">
-</div>
-`)
-	writeLayoutFooter(b)
-	writeHTML(w, b)
+	render(w, indexTemplate, struct {
+		Posts     []Post
+		Me        User
+		CSRFToken string
+		Flash     string
+	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -1123,28 +1027,14 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	// user.html
-	b := bufPool.Get().(*bytes.Buffer)
-	writeLayoutHeader(b, me)
-	b.WriteString(`<div class="isu-user">
-  <div><span class="isu-user-account-name">`)
-	b.WriteString(html.EscapeString(user.AccountName))
-	b.WriteString(`さん</span>のページ</div>
-  <div>投稿数 <span class="isu-post-count">`)
-	b.WriteString(strconv.Itoa(postCount))
-	b.WriteString(`</span></div>
-  <div>コメント数 <span class="isu-comment-count">`)
-	b.WriteString(strconv.Itoa(commentCount))
-	b.WriteString(`</span></div>
-  <div>被コメント数 <span class="isu-commented-count">`)
-	b.WriteString(strconv.Itoa(commentedCount))
-	b.WriteString(`</span></div>
-</div>
-
-`)
-	writePosts(b, posts)
-	writeLayoutFooter(b)
-	writeHTML(w, b)
+	render(w, userTemplate, struct {
+		Posts          []Post
+		User           User
+		PostCount      int
+		CommentCount   int
+		CommentedCount int
+		Me             User
+	}{posts, user, postCount, commentCount, commentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -1179,9 +1069,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b := bufPool.Get().(*bytes.Buffer)
-	writePosts(b, posts)
-	writeHTML(w, b)
+	render(w, postsTemplate, posts)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -1212,12 +1100,10 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	// post_id.html
-	b := bufPool.Get().(*bytes.Buffer)
-	writeLayoutHeader(b, me)
-	writePost(b, posts[0])
-	writeLayoutFooter(b)
-	writeHTML(w, b)
+	render(w, postIDTemplate, struct {
+		Post Post
+		Me   User
+	}{posts[0], me})
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
@@ -1263,13 +1149,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	filedata, err := io.ReadAll(file)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+	// 画像は io.ReadAll で読み込まず、ファイルを書き出すときに multipart のデータから直接コピーする。
+	// 1MB 前後の []byte を投稿のたびに確保しないため。サイズは multipart のヘッダーで判定する
+	defer file.Close()
 
-	if len(filedata) > UploadLimit {
+	if header.Size > UploadLimit {
 		session := getSession(r)
 		session.Values["notice"] = "ファイルサイズが大きすぎます"
 		session.Save(r, w)
@@ -1309,7 +1193,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 画像の保存先はファイルだけなので、書き出せなければ投稿を取り消す
-	if err := writeImageFile(int(pid), mime, filedata); err != nil {
+	if err := writeImageFile(int(pid), mime, file); err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -1362,7 +1246,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
 		// 次回からは nginx がファイルを直接返す
-		if err := writeImageFile(post.ID, post.Mime, post.Imgdata); err != nil {
+		if err := writeImageFile(post.ID, post.Mime, bytes.NewReader(post.Imgdata)); err != nil {
 			log.Print(err)
 		}
 
@@ -1441,41 +1325,11 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// banned.html
-	b := bufPool.Get().(*bytes.Buffer)
-	writeLayoutHeader(b, me)
-	b.WriteString(`<div>
-  <form method="post" action="/admin/banned">
-`)
-	for _, u := range users {
-		id := strconv.Itoa(u.ID)
-		name := html.EscapeString(u.AccountName)
-		b.WriteString(`    <div>
-      <input type="checkbox" name="uid[]" id="uid_`)
-		b.WriteString(id)
-		b.WriteString(`" value="`)
-		b.WriteString(id)
-		b.WriteString(`" data-account-name="`)
-		b.WriteString(name)
-		b.WriteString(`"> <label for="uid_`)
-		b.WriteString(id)
-		b.WriteString(`">`)
-		b.WriteString(name)
-		b.WriteString(`</label>
-    </div>
-`)
-	}
-	b.WriteString(`    <div class="form-submit">
-      <input type="hidden" name="csrf_token" value="`)
-	b.WriteString(html.EscapeString(getCSRFToken(r)))
-	b.WriteString(`">
-      <input type="submit" name="submit" value="submit">
-    </div>
-  </form>
-</div>
-`)
-	writeLayoutFooter(b)
-	writeHTML(w, b)
+	render(w, bannedTemplate, struct {
+		Users     []User
+		Me        User
+		CSRFToken string
+	}{users, me, getCSRFToken(r)})
 }
 
 func postAdminBanned(w http.ResponseWriter, r *http.Request) {
